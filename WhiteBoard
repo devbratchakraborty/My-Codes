@@ -1,0 +1,538 @@
+import pygame
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import sys
+import os
+from PIL import Image, ImageDraw
+import math
+import random
+
+# Initialize pygame
+pygame.init()
+
+# Constants
+WIDTH, HEIGHT = 1000, 700
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
+GRAY = (200, 200, 200)
+DARK_GRAY = (100, 100, 100)
+LIGHT_BLUE = (173, 216, 230)
+
+# Create the screen
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("AI Whiteboard - Transform Sketches to UI")
+
+# Drawing variables
+drawing = False
+last_pos = None
+current_tool = "pencil"
+current_color = BLACK
+brush_size = 5
+canvas = pygame.Surface((WIDTH, HEIGHT))
+canvas.fill(WHITE)
+
+# Font
+font = pygame.font.SysFont(None, 24)
+large_font = pygame.font.SysFont(None, 32)
+
+# UI elements
+buttons = [
+    {"rect": pygame.Rect(10, 10, 100, 40), "label": "Pencil", "tool": "pencil"},
+    {"rect": pygame.Rect(120, 10, 100, 40), "label": "Eraser", "tool": "eraser"},
+    {"rect": pygame.Rect(230, 10, 100, 40), "label": "Rectangle", "tool": "rectangle"},
+    {"rect": pygame.Rect(340, 10, 100, 40), "label": "Circle", "tool": "circle"},
+    {"rect": pygame.Rect(450, 10, 120, 40), "label": "Recognize", "tool": "recognize"},
+    {"rect": pygame.Rect(580, 10, 100, 40), "label": "Clear", "tool": "clear"},
+    {"rect": pygame.Rect(690, 10, 120, 40), "label": "Train Model", "tool": "train"}
+]
+
+color_buttons = [
+    {"rect": pygame.Rect(10, 60, 30, 30), "color": BLACK},
+    {"rect": pygame.Rect(50, 60, 30, 30), "color": RED},
+    {"rect": pygame.Rect(90, 60, 30, 30), "color": GREEN},
+    {"rect": pygame.Rect(130, 60, 30, 30), "color": BLUE}
+]
+
+# Define UI elements for recognition
+ui_elements = ["button", "textbox", "checkbox", "radio", "slider", "logo", "image", "icon"]
+
+# Simple heuristic rules for shape detection (fallback when model is not trained)
+def heuristic_shape_detection(drawing_data):
+    # Count non-white pixels
+    non_white_pixels = np.sum(drawing_data < 240)
+    if non_white_pixels < 50:  # Almost empty canvas
+        return "No drawing detected"
+    
+    # Calculate bounding box
+    rows = np.any(drawing_data < 240, axis=1)
+    cols = np.any(drawing_data < 240, axis=0)
+    ymin, ymax = np.where(rows)[0][[0, -1]] if np.any(rows) else (0, 0)
+    xmin, xmax = np.where(cols)[0][[0, -1]] if np.any(cols) else (0, 0)
+    
+    width = xmax - xmin
+    height = ymax - ymin
+    
+    # Calculate aspect ratio
+    aspect_ratio = width / height if height > 0 else 0
+    
+    # Calculate circularity
+    area = non_white_pixels
+    perimeter = calculate_perimeter(drawing_data)
+    circularity = (4 * math.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+    
+    # Simple heuristics
+    if 0.8 < aspect_ratio < 1.2 and circularity > 0.6:
+        return "circle"
+    elif 1.5 < aspect_ratio < 4.0:
+        return "slider"
+    elif 0.2 < aspect_ratio < 0.8:
+        return "button"
+    elif area > 1000:
+        return "image"
+    else:
+        return random.choice(["button", "textbox", "checkbox"])
+    
+def calculate_perimeter(drawing_data):
+    # Simple perimeter estimation
+    kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    edges = np.zeros_like(drawing_data)
+    
+    for y in range(1, drawing_data.shape[0]-1):
+        for x in range(1, drawing_data.shape[1]-1):
+            if drawing_data[y, x] < 240:  # Non-white pixel
+                neighborhood = drawing_data[y-1:y+2, x-1:x+2] < 240
+                if np.sum(neighborhood * kernel) < 5:  # Edge pixel
+                    edges[y, x] = 1
+                    
+    return np.sum(edges)
+
+# Deep Learning Model
+class SketchCNN(nn.Module):
+    def __init__(self, num_classes):
+        super(SketchCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(0.25)
+        self.fc1 = nn.Linear(128 * 12 * 12, 512)
+        self.fc2 = nn.Linear(512, num_classes)
+        
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = self.pool(torch.relu(self.conv3(x)))
+        x = x.view(-1, 128 * 12 * 12)
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+# Custom transforms without torchvision
+def resize_transform(img, size=(96, 96)):
+    return img.resize(size, Image.Resampling.LANCZOS)
+
+def to_tensor_transform(img):
+    img_array = np.array(img) / 255.0
+    return torch.FloatTensor(img_array)
+
+# Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SketchCNN(len(ui_elements)).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Training status
+training_status = "Using heuristic detection"
+training_progress = 0
+model_trained = False
+
+# Create data directory if it doesn't exist
+if not os.path.exists("sketch_data"):
+    os.makedirs("sketch_data")
+    for element in ui_elements:
+        os.makedirs(os.path.join("sketch_data", element))
+
+# Generate some sample training data if none exists
+def generate_sample_data():
+    for element in ui_elements:
+        element_dir = os.path.join("sketch_data", element)
+        if len(os.listdir(element_dir)) < 3:  # If less than 3 examples
+            for i in range(3):
+                # Create a simple sample image
+                img = Image.new('L', (96, 96), color=255)
+                draw = ImageDraw.Draw(img)
+                
+                if element == "button":
+                    draw.rectangle([20, 20, 76, 76], outline=0, width=3)
+                    draw.text((35, 40), "OK", fill=0)
+                elif element == "textbox":
+                    draw.rectangle([15, 35, 81, 61], outline=0, width=2)
+                    draw.line([15, 45, 81, 45], fill=0, width=1)
+                elif element == "checkbox":
+                    draw.rectangle([30, 30, 66, 66], outline=0, width=2)
+                elif element == "radio":
+                    draw.ellipse([30, 30, 66, 66], outline=0, width=2)
+                elif element == "slider":
+                    draw.rectangle([10, 40, 86, 56], outline=0, width=2)
+                    draw.rectangle([40, 30, 56, 66], outline=0, width=2)
+                elif element == "logo":
+                    draw.ellipse([25, 25, 71, 71], outline=0, width=3)
+                    draw.text((35, 45), "Logo", fill=0)
+                elif element == "image":
+                    draw.rectangle([15, 15, 81, 81], outline=0, width=3)
+                    draw.line([15, 15, 81, 81], fill=0, width=2)
+                    draw.line([81, 15, 15, 81], fill=0, width=2)
+                elif element == "icon":
+                    draw.rectangle([30, 20, 66, 76], outline=0, width=2)
+                    draw.ellipse([35, 40, 61, 66], outline=0, width=2)
+                
+                img.save(os.path.join(element_dir, f"sample_{i}.png"))
+
+# Generate sample data if needed
+generate_sample_data()
+
+def draw_ui():
+    # Draw toolbar background
+    pygame.draw.rect(screen, GRAY, (0, 0, WIDTH, 100))
+    
+    # Draw buttons
+    for button in buttons:
+        pygame.draw.rect(screen, DARK_GRAY if current_tool == button["tool"] else LIGHT_BLUE, button["rect"])
+        pygame.draw.rect(screen, BLACK, button["rect"], 2)
+        text = font.render(button["label"], True, BLACK)
+        screen.blit(text, (button["rect"].x + 10, button["rect"].y + 10))
+    
+    # Draw color buttons
+    for color_button in color_buttons:
+        pygame.draw.rect(screen, color_button["color"], color_button["rect"])
+        pygame.draw.rect(screen, BLACK, color_button["rect"], 2)
+    
+    # Draw brush size indicator
+    pygame.draw.circle(screen, current_color, (200, 75), brush_size)
+    text = font.render(f"Size: {brush_size}", True, BLACK)
+    screen.blit(text, (220, 65))
+    
+    # Draw tokens info
+    tokens_text = font.render("Free Tokens: 5", True, BLACK)
+    screen.blit(tokens_text, (WIDTH - 150, 40))
+    
+    # Draw training status
+    status_text = font.render(f"Status: {training_status}", True, BLACK)
+    screen.blit(status_text, (10, HEIGHT - 30))
+    
+    # Draw progress bar if training
+    if "Training" in training_status:
+        pygame.draw.rect(screen, BLACK, (150, HEIGHT - 40, 200, 20), 1)
+        pygame.draw.rect(screen, GREEN, (152, HEIGHT - 38, 196 * training_progress, 16))
+
+def preprocess_drawing():
+    # Convert the drawing to a numpy array for DL processing
+    drawing_data = pygame.surfarray.array3d(canvas)
+    drawing_data = drawing_data[100:, :]  # Exclude toolbar area
+    
+    # Convert to grayscale and resize
+    img_surface = pygame.surfarray.make_surface(drawing_data)
+    img_str = pygame.image.tostring(img_surface, "RGB")
+    img = Image.frombytes("RGB", (drawing_data.shape[1], drawing_data.shape[0]), img_str)
+    img = img.convert('L')  # Convert to grayscale
+    img = resize_transform(img)  # Resize to match model input
+    
+    # Convert to tensor
+    img_tensor = to_tensor_transform(img).unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+    
+    return img_tensor.to(device), np.array(img)
+
+def recognize_shape():
+    global model_trained, training_status
+    
+    drawing_tensor, drawing_array = preprocess_drawing()
+    
+    # Use heuristic detection if model is not trained
+    if not model_trained:
+        result = heuristic_shape_detection(drawing_array)
+        return f"Heuristic: {result}"
+    
+    try:
+        model.eval()
+        with torch.no_grad():
+            output = model(drawing_tensor)
+            _, predicted = torch.max(output, 1)
+            confidence = torch.nn.functional.softmax(output, dim=1)[0][predicted].item()
+            
+            if confidence > 0.7:
+                return f"AI: {ui_elements[predicted.item()]} ({confidence:.2%})"
+            else:
+                # Fall back to heuristic if confidence is low
+                result = heuristic_shape_detection(drawing_array)
+                return f"Low confidence, heuristic: {result}"
+    except Exception as e:
+        result = heuristic_shape_detection(drawing_array)
+        return f"Error, heuristic: {result}"
+
+def save_training_example(label):
+    # Save the current drawing as a training example
+    drawing_data = pygame.surfarray.array3d(canvas)
+    drawing_data = drawing_data[100:, :]  # Exclude toolbar area
+    
+    # Convert to PIL image
+    img_surface = pygame.surfarray.make_surface(drawing_data)
+    img_str = pygame.image.tostring(img_surface, "RGB")
+    img = Image.frombytes("RGB", (drawing_data.shape[1], drawing_data.shape[0]), img_str)
+    img = img.convert('L')  # Convert to grayscale
+    
+    # Save to appropriate directory
+    label_dir = os.path.join("sketch_data", label)
+    count = len([f for f in os.listdir(label_dir) if f.endswith('.png')])
+    img.save(os.path.join(label_dir, f"{count+1}.png"))
+    
+    return f"Saved as {label} example"
+
+def load_training_data():
+    images = []
+    labels = []
+    
+    for label_idx, element in enumerate(ui_elements):
+        element_dir = os.path.join("sketch_data", element)
+        if os.path.exists(element_dir):
+            for img_file in os.listdir(element_dir):
+                if img_file.endswith('.png'):
+                    img_path = os.path.join(element_dir, img_file)
+                    img = Image.open(img_path).convert('L')  # Convert to grayscale
+                    img = resize_transform(img)  # Resize
+                    img_tensor = to_tensor_transform(img)  # Convert to tensor
+                    
+                    images.append(img_tensor)
+                    labels.append(label_idx)
+    
+    if len(images) == 0:
+        return None, None
+    
+    # Stack all images and labels
+    images_tensor = torch.stack(images)
+    labels_tensor = torch.LongTensor(labels)
+    
+    return images_tensor, labels_tensor
+
+def train_model():
+    global model, training_status, training_progress, model_trained
+    
+    training_status = "Training in progress..."
+    training_progress = 0
+    
+    # Load training data
+    images, labels = load_training_data()
+    
+    if images is None:
+        training_status = "No training data available"
+        return
+    
+    # Check if we have enough data
+    min_examples = 3
+    has_enough_data = True
+    for element in ui_elements:
+        element_dir = os.path.join("sketch_data", element)
+        if os.path.exists(element_dir):
+            examples = len([f for f in os.listdir(element_dir) if f.endswith('.png')])
+            if examples < min_examples:
+                has_enough_data = False
+                break
+    
+    if not has_enough_data:
+        training_status = f"Need at least {min_examples} examples per class"
+        return
+    
+    # Training loop
+    num_epochs = 5  # Reduced for faster training
+    model.train()
+    
+    # Add channel dimension to images
+    images = images.unsqueeze(1)  # Add channel dimension
+    
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        
+        # Forward pass
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item()
+        
+        # Update progress
+        training_progress = (epoch + 1) / num_epochs
+        
+        # Update UI occasionally
+        if epoch % 1 == 0:
+            draw_ui()
+            pygame.display.flip()
+        
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss:.4f}")
+    
+    training_status = "Model trained - AI detection active"
+    training_progress = 1.0
+    model_trained = True
+    
+    # Save the model
+    torch.save(model.state_dict(), "sketch_cnn.pth")
+
+# Load model if it exists
+if os.path.exists("sketch_cnn.pth"):
+    model.load_state_dict(torch.load("sketch_cnn.pth", map_location=device))
+    training_status = "Model trained - AI detection active"
+    training_progress = 1.0
+    model_trained = True
+
+def main():
+    global drawing, last_pos, current_tool, current_color, brush_size, canvas
+    global training_status, training_progress
+    
+    running = True
+    clock = pygame.time.Clock()
+    start_pos = None
+    recognition_result = ""
+    result_timer = 0
+    
+    # Import here to avoid issues
+    from PIL import ImageDraw
+    
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.pos[1] > 100:  # Drawing area
+                    drawing = True
+                    last_pos = event.pos
+                    
+                    if current_tool in ["rectangle", "circle"]:
+                        start_pos = event.pos
+                else:
+                    # Check if a button was clicked
+                    for button in buttons:
+                        if button["rect"].collidepoint(event.pos):
+                            current_tool = button["tool"]
+                            if current_tool == "clear":
+                                canvas.fill(WHITE)
+                                recognition_result = ""
+                            elif current_tool == "recognize":
+                                result = recognize_shape()
+                                recognition_result = result
+                                result_timer = 180  # Show for 3 seconds (60 FPS)
+                            elif current_tool == "train":
+                                train_model()
+                    
+                    # Check if a color button was clicked
+                    for color_button in color_buttons:
+                        if color_button["rect"].collidepoint(event.pos):
+                            current_color = color_button["color"]
+            
+            elif event.type == pygame.MOUSEBUTTONUP:
+                drawing = False
+                last_pos = None
+                
+                if current_tool == "rectangle" and start_pos:
+                    end_pos = event.pos
+                    pygame.draw.rect(canvas, current_color, 
+                                    (min(start_pos[0], end_pos[0]), 
+                                     min(start_pos[1], end_pos[1]),
+                                     abs(end_pos[0] - start_pos[0]),
+                                     abs(end_pos[1] - start_pos[1])), brush_size)
+                    start_pos = None
+                
+                elif current_tool == "circle" and start_pos:
+                    end_pos = event.pos
+                    radius = int(((end_pos[0] - start_pos[0])**2 + (end_pos[1] - start_pos[1])**2)**0.5)
+                    pygame.draw.circle(canvas, current_color, start_pos, radius, brush_size)
+                    start_pos = None
+            
+            elif event.type == pygame.MOUSEMOTION:
+                if drawing and event.pos[1] > 100:  # Drawing area
+                    if current_tool == "pencil":
+                        if last_pos:
+                            pygame.draw.line(canvas, current_color, last_pos, event.pos, brush_size)
+                        last_pos = event.pos
+                    elif current_tool == "eraser":
+                        if last_pos:
+                            pygame.draw.line(canvas, WHITE, last_pos, event.pos, brush_size * 2)
+                        last_pos = event.pos
+            
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
+                    brush_size = min(brush_size + 1, 20)
+                elif event.key == pygame.K_MINUS:
+                    brush_size = max(brush_size - 1, 1)
+                elif event.key == pygame.K_s:
+                    # Show label selection UI
+                    label_selection = True
+                    selected_label = 0
+                    
+                    while label_selection:
+                        for e in pygame.event.get():
+                            if e.type == pygame.QUIT:
+                                pygame.quit()
+                                sys.exit()
+                            elif e.type == pygame.KEYDOWN:
+                                if e.key == pygame.K_UP:
+                                    selected_label = (selected_label - 1) % len(ui_elements)
+                                elif e.key == pygame.K_DOWN:
+                                    selected_label = (selected_label + 1) % len(ui_elements)
+                                elif e.key == pygame.K_RETURN:
+                                    result = save_training_example(ui_elements[selected_label])
+                                    recognition_result = result
+                                    result_timer = 180
+                                    label_selection = False
+                                elif e.key == pygame.K_ESCAPE:
+                                    label_selection = False
+                        
+                        # Draw label selection UI
+                        screen.fill(LIGHT_BLUE)
+                        title = large_font.render("Select label for this drawing:", True, BLACK)
+                        screen.blit(title, (WIDTH//2 - title.get_width()//2, 100))
+                        
+                        for i, element in enumerate(ui_elements):
+                            color = GREEN if i == selected_label else BLACK
+                            text = large_font.render(element, True, color)
+                            screen.blit(text, (WIDTH//2 - text.get_width()//2, 150 + i*40))
+                        
+                        instruction = font.render("Use UP/DOWN arrows to select, ENTER to confirm, ESC to cancel", True, BLACK)
+                        screen.blit(instruction, (WIDTH//2 - instruction.get_width()//2, HEIGHT - 50))
+                        
+                        pygame.display.flip()
+                        clock.tick(60)
+        
+        # Decrease result timer
+        if result_timer > 0:
+            result_timer -= 1
+        
+        # Draw everything
+        screen.fill(WHITE)
+        screen.blit(canvas, (0, 0))
+        draw_ui()
+        
+        # Draw recognition result
+        if result_timer > 0 and recognition_result:
+            result_surface = pygame.Surface((500, 50), pygame.SRCALPHA)
+            result_surface.fill((0, 0, 0, 200))
+            screen.blit(result_surface, (WIDTH//2 - 250, HEIGHT//2 - 25))
+            result_text = large_font.render(f"Result: {recognition_result}", True, WHITE)
+            screen.blit(result_text, (WIDTH//2 - result_text.get_width()//2, HEIGHT//2 - result_text.get_height()//2))
+        
+        pygame.display.flip()
+        clock.tick(60)
+    
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
